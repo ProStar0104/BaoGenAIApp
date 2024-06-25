@@ -19,8 +19,7 @@ import shutil
 
 load_dotenv()
 app = Quart(__name__)
-
-app = cors(app, allow_origin="*")
+cors(app)
 
 client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -304,7 +303,7 @@ def merge_videos(video_urls, search_query):
     text_script = generate_script(search_query)
     
     try:
-        audio_file_path = "audio_tts.mp3"
+        audio_file_path = tempfile.mktemp(suffix='.mp3')
         generate_audio(text_script, audio_file_path)
         audio_clip = AudioFileClip(audio_file_path)
     except Exception as e:

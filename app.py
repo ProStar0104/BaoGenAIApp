@@ -100,8 +100,8 @@ class MyBot:
     async def generate_and_send_video(self, search_query, conversation_reference):
         try:
             video_urls = await fetch_videos(search_query)
-            merged_video_path = merge_videos(video_urls, search_query)
-            video_url = upload_to_azure(merged_video_path)
+            merged_video_path = await merge_videos(video_urls, search_query)
+            video_url = await upload_to_azure(merged_video_path)
             
             # Send the video URL proactively
             await self.send_proactive_message(conversation_reference, f"Here is your merged video: {video_url}")
@@ -303,7 +303,7 @@ def merge_videos(video_urls, search_query):
     text_script = generate_script(search_query)
     
     try:
-        audio_file_path = "audio_tts.mp3"
+        audio_file_path = tempfile.mktemp(suffix='.mp3')
         generate_audio(text_script, audio_file_path)
         audio_clip = AudioFileClip(audio_file_path)
     except Exception as e:
@@ -343,24 +343,44 @@ def merge_videos(video_urls, search_query):
     final_clip.write_videofile(merged_video_path, codec='libx264', audio_codec='aac')
     return merged_video_path
 
+
 def upload_to_azure(file_path):
+
     connect_str = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
+
     container_name = os.getenv('AZURE_STORAGE_CONTAINER_NAME')
 
+
+
     blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+
     blob_client = blob_service_client.get_blob_client(container=container_name, blob=os.path.basename(file_path))
 
+
+
     with open(file_path, 'rb') as data:
+
         blob_client.upload_blob(data, overwrite=True)
 
+
+
     sas_token = generate_blob_sas(
+
         account_name=blob_client.account_name,
+
         container_name=blob_client.container_name,
+
         blob_name=blob_client.blob_name,
+
         account_key=blob_service_client.credential.account_key,
+
         permission=BlobSasPermissions(read=True),
+
         expiry=datetime.datetime.utcnow() + datetime.timedelta(days=365 * 10)
+
     )
+
+
 
     return f"{blob_client.url}?{sas_token}"
 

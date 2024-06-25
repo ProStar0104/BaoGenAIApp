@@ -100,8 +100,8 @@ class MyBot:
     async def generate_and_send_video(self, search_query, conversation_reference):
         try:
             video_urls = await fetch_videos(search_query)
-            merged_video_path = await merge_videos(video_urls, search_query)
-            video_url = await upload_to_azure(merged_video_path)
+            merged_video_path = merge_videos(video_urls, search_query)
+            video_url = upload_to_azure(merged_video_path)
             
             # Send the video URL proactively
             await self.send_proactive_message(conversation_reference, f"Here is your merged video: {video_url}")

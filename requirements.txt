@@ -82,4 +82,4 @@ Werkzeug==3.0.3
 wsproto==1.2.0
 yarl==1.9.4
 azure-data-tables
-openai==0.28
+openai

@@ -13,6 +13,7 @@ from botbuilder.schema import Activity, ActivityTypes
 import openai
 import json
 from text_to_speech import save
+import asyncio
 
 load_dotenv()
 app = Quart(__name__)
@@ -33,11 +34,15 @@ class MyBot:
                 search_query = turn_context.activity.value["query"]
                 generate_type = turn_context.activity.value["generate_type"]
                 if generate_type == "Video":
-                    video_urls = await fetch_videos(search_query)
-                    merged_video_path = await merge_videos(video_urls, search_query)
-                    video_url = await upload_to_azure(merged_video_path)
-                    await turn_context.send_activity(f"Here is your merged video: {video_url}")
                     await send_input_card(turn_context)
+                    video_generation_url = os.getenv("AZURE_FUNCTION_URL")
+                    response = requests.post(video_generation_url, json={"query": search_query})
+                    if response.status_code == 202:
+                        operation_id = response.json()["operation_id"]
+                        await turn_context.send_activity("Video generation started. Please wait...")
+                        asyncio.create_task(self.poll_status(turn_context, operation_id))
+                    else:
+                        await turn_context.send_activity("Failed to start video generation. Please try again.")
                 elif generate_type == "Image":
                     generated_image_path = await generate_image(search_query)
                     image_url = await upload_to_azure(generated_image_path)
@@ -49,6 +54,20 @@ class MyBot:
             for member in turn_context.activity.members_added:
                 if member.id != turn_context.activity.recipient.id:
                     await send_input_card(turn_context)
+    
+    async def poll_status(self, turn_context: TurnContext, operation_id: str):
+        while True:
+            status_response = requests.get(f"{os.getenv('AZURE_FUNCTION_STATUS_URL')}?operation_id={operation_id}")
+            status_data = status_response.json()
+            if status_data["status"] == "completed":
+                await turn_context.send_activity(f"Video generation complete: {status_data['video_url']}")
+                break
+            elif status_data["status"] == "failed":
+                await turn_context.send_activity("Video generation failed. Please try again.")
+                break
+            else:
+                await turn_context.send_activity("Video generation is in progress. Please wait...")
+            await asyncio.sleep(30)  
 
 async def send_input_card(turn_context: TurnContext):
     card = {
@@ -222,12 +241,15 @@ async def generate_script(topic):
 
 async def merge_videos(video_urls, search_query):
     clips = []
+    target_width = 1280
+    target_height = 720
     for url in video_urls:
         response = requests.get(url)
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_video:
             temp_video.write(response.content)
             temp_video_path = temp_video.name
             clip = VideoFileClip(temp_video_path)
+            clip = clip.resize(newsize=(target_width, target_height))
             clips.append(clip)
 
     if not clips:

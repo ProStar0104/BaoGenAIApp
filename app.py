@@ -10,10 +10,12 @@ from dotenv import load_dotenv
 import datetime
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext, ConversationState, MemoryStorage, CardFactory, MessageFactory
 from botbuilder.schema import Activity, ActivityTypes
+from botbuilder.dialogs import ComponentDialog, DialogSet, DialogTurnStatus, WaterfallDialog, WaterfallStepContext
 import openai
+import asyncio
 import json
 from text_to_speech import save
-import asyncio
+import shutil
 
 load_dotenv()
 app = Quart(__name__)
@@ -22,52 +24,108 @@ cors(app)
 client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Initialize bot framework adapter
-SETTINGS = BotFrameworkAdapterSettings(app_id=os.getenv("MICROSOFT_APP_ID"), app_password=os.getenv("MICROSOFT_APP_PASSWORD"))
+MICROSOFT_APP_ID = os.getenv("MICROSOFT_APP_ID")
+MICROSOFT_APP_PASSWORD = os.getenv("MICROSOFT_APP_PASSWORD")
+SETTINGS = BotFrameworkAdapterSettings(app_id=MICROSOFT_APP_ID, app_password=MICROSOFT_APP_PASSWORD)
 adapter = BotFrameworkAdapter(SETTINGS)
 memory = MemoryStorage()
 conversation_state = ConversationState(memory)
 
+conversation_references = {}
+
 class MyBot:
+    def __init__(self, conversation_state: ConversationState):
+        self.conversation_state = conversation_state
+        self.dialog_state = self.conversation_state.create_property("DialogState")
+        self.user_state = self.conversation_state.create_property("UserProfile")
+        self.dialogs = DialogSet(self.dialog_state)
+        self.dialogs.add(WaterfallDialog("mainDialog", [self.process_request, self.process_request_end]))
+
     async def on_turn(self, turn_context: TurnContext):
         if turn_context.activity.type == ActivityTypes.message:
-            if turn_context.activity.value and "query" in turn_context.activity.value and "generate_type" in turn_context.activity.value:
-                search_query = turn_context.activity.value["query"]
-                generate_type = turn_context.activity.value["generate_type"]
-                if generate_type == "Video":
-                    await send_input_card(turn_context)
-                    video_generation_url = os.getenv("AZURE_FUNCTION_URL")
-                    response = requests.post(video_generation_url, json={"query": search_query})
-                    if response.status_code == 202:
-                        operation_id = response.json()["operation_id"]
-                        await turn_context.send_activity("Video generation started. Please wait...")
-                        asyncio.create_task(self.poll_status(turn_context, operation_id))
-                    else:
-                        await turn_context.send_activity("Failed to start video generation. Please try again.")
-                elif generate_type == "Image":
-                    generated_image_path = await generate_image(search_query)
-                    image_url = await upload_to_azure(generated_image_path)
-                    await turn_context.send_activity(f"Here is your generated image: {image_url}")
-                    await send_input_card(turn_context)
-            else:
-                await send_input_card(turn_context)
+            dialog_context = await self.dialogs.create_context(turn_context)
+            result = await dialog_context.continue_dialog()
+
+            if result.status == DialogTurnStatus.Empty:
+                await dialog_context.begin_dialog("mainDialog")
+            
+            await self.conversation_state.save_changes(turn_context)
         elif turn_context.activity.type == ActivityTypes.conversation_update:
             for member in turn_context.activity.members_added:
                 if member.id != turn_context.activity.recipient.id:
                     await send_input_card(turn_context)
     
-    async def poll_status(self, turn_context: TurnContext, operation_id: str):
-        while True:
-            status_response = requests.get(f"{os.getenv('AZURE_FUNCTION_STATUS_URL')}?operation_id={operation_id}")
-            status_data = status_response.json()
-            if status_data["status"] == "completed":
-                await turn_context.send_activity(f"Video generation complete: {status_data['video_url']}")
-                break
-            elif status_data["status"] == "failed":
-                await turn_context.send_activity("Video generation failed. Please try again.")
-                break
-            else:
-                await turn_context.send_activity("Video generation is in progress. Please wait...")
-            await asyncio.sleep(30)  
+    async def process_request(self, step_context: WaterfallStepContext):
+        turn_context = step_context.context
+        user_profile = await self.user_state.get(turn_context, lambda: {})
+
+        if user_profile.get("request_in_progress"):
+            await turn_context.send_activity("Your previous request is still being processed. Please wait.")
+            return await step_context.end_dialog()
+
+        if turn_context.activity.value and "query" in turn_context.activity.value and "generate_type" in turn_context.activity.value:
+            search_query = turn_context.activity.value["query"]
+            generate_type = turn_context.activity.value["generate_type"]
+            
+            user_profile["request_in_progress"] = True
+            await self.user_state.set(turn_context, user_profile)
+
+            if generate_type == "Video":
+                # Save conversation reference
+                conversation_reference = TurnContext.get_conversation_reference(turn_context.activity)
+                await save_conversation_reference(turn_context.activity.conversation.id, conversation_reference)
+                
+                # Acknowledge user request
+                await turn_context.send_activity("Your video is being generated. This may take a few minutes. You will receive a notification once it's ready.")
+                
+                # Start video generation asynchronously
+                asyncio.create_task(self.generate_and_send_video(search_query, conversation_reference))
+            elif generate_type == "Image":
+                # Process image generation normally
+                generated_image_path = await generate_image(search_query)
+                image_url = await upload_to_azure(generated_image_path)
+                await turn_context.send_activity(f"Here is your generated image: {image_url}")
+                await send_input_card(turn_context)
+        else:
+            await send_input_card(turn_context)
+        
+        return await step_context.next()
+
+    async def process_request_end(self, step_context: WaterfallStepContext):
+        user_profile = await self.user_state.get(step_context.context, lambda: {})
+        user_profile["request_in_progress"] = False
+        await self.user_state.set(step_context.context, user_profile)
+        return await step_context.end_dialog()
+
+    async def generate_and_send_video(self, search_query, conversation_reference):
+        try:
+            video_urls = await fetch_videos(search_query)
+            merged_video_path = await merge_videos(video_urls, search_query)
+            video_url = await upload_to_azure(merged_video_path)
+            
+            # Send the video URL proactively
+            await self.send_proactive_message(conversation_reference, f"Here is your merged video: {video_url}")
+        except Exception as e:
+            # Handle exceptions and notify user
+            await self.send_proactive_message(conversation_reference, f"An error occurred while generating the video: {str(e)}")
+        finally:
+            # Reset the request_in_progress flag
+            turn_context = TurnContext(adapter, conversation_reference)
+            user_profile = await self.user_state.get(turn_context, lambda: {})
+            user_profile["request_in_progress"] = False
+            await self.user_state.set(turn_context, user_profile)
+
+    async def send_proactive_message(self, conversation_reference, message):
+        proactive_adapter = BotFrameworkAdapter(SETTINGS)
+        async def callback(turn_context: TurnContext):
+            await turn_context.send_activity(message)
+        try:
+            await proactive_adapter.continue_conversation(conversation_reference, callback, MICROSOFT_APP_ID)
+        except Exception as e:
+            logging.error(f"Error sending proactive message: {e}")
+
+async def save_conversation_reference(conversation_id, conversation_reference):
+    conversation_references[conversation_id] = conversation_reference
 
 async def send_input_card(turn_context: TurnContext):
     card = {
@@ -105,21 +163,7 @@ async def send_input_card(turn_context: TurnContext):
     card_attachment = CardFactory.adaptive_card(card)
     await turn_context.send_activity(MessageFactory.attachment(card_attachment))
 
-bot = MyBot()
-
-@app.route('/api/messages', methods=['POST'])
-async def messages():
-    logging.info('Processing request to generate content.')
-    if "application/json" in request.headers["content-type"]:
-        body = await request.get_json()
-    else:
-        return jsonify({"error": "Unsupported content type"}), 415
-
-    activity = Activity().deserialize(body)
-    auth_header = request.headers["Authorization"] if "Authorization" in request.headers else ""
-
-    await adapter.process_activity(activity, auth_header, bot.on_turn)
-    return "", 200
+bot = MyBot(conversation_state)
 
 async def generate_image(search_query):
     openai_api_key = os.getenv('OPENAI_API_KEY')
@@ -143,7 +187,7 @@ async def generate_image(search_query):
 
     # Download the generated image
     image_response = requests.get(image_url)
-    if image_response.status_code != 200:
+    if (image_response.status_code != 200):
         raise Exception(f"Failed to download image: {image_response.text}")
 
     # Save the image to a temporary file
@@ -176,7 +220,7 @@ async def generate_audio(text, output_filename):
     try:
         save(text, language, file=output_filename)
     except Exception as e:
-        logging.error(f"Error in text-to-speech conversion: {e}")
+        logging.error(f"Error in text-to-speech conversion: {e}")   
         raise
 
 async def generate_script(topic):
@@ -207,7 +251,7 @@ async def generate_script(topic):
         {"script": "Here is the script ..."}
         """
     )
-
+    client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
     response = client.chat.completions.create(
         model="gpt-4",
         messages=[
@@ -239,85 +283,86 @@ async def generate_script(topic):
     print(script)
     return script
 
+
 async def merge_videos(video_urls, search_query):
     clips = []
     target_width = 1280
     target_height = 720
-    for url in video_urls:
-        response = requests.get(url)
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_video:
-            temp_video.write(response.content)
-            temp_video_path = temp_video.name
-            clip = VideoFileClip(temp_video_path)
-            clip = clip.resize(newsize=(target_width, target_height))
-            clips.append(clip)
-
-    if not clips:
-        raise Exception("No suitable video clips found.")
-
-    text_script = await generate_script(search_query)
+    script = await generate_script(search_query)
     
+    temp_dir = tempfile.mkdtemp()
+
     try:
-        audio_file_path = "audio_tts.mp3"
-        await generate_audio(text_script, audio_file_path)
-        audio_clip = AudioFileClip(audio_file_path)
-    except Exception as e:
-        logging.error(f"Error generating audio: {e}")
-        raise
-
-    audio_duration = audio_clip.duration
-    total_video_duration = sum(clip.duration for clip in clips)
-    
-    if total_video_duration < audio_duration:
-        # Repeat the video clips to match the audio duration
-        repeated_clips = []
-        current_duration = 0
-        while current_duration < audio_duration:
-            for clip in clips:
-                if current_duration + clip.duration > audio_duration:
-                    remaining_duration = audio_duration - current_duration
-                    repeated_clips.append(clip.subclip(0, remaining_duration))
-                    current_duration += remaining_duration
-                    break
-                repeated_clips.append(clip)
-                current_duration += clip.duration
-        clips = repeated_clips
-    else:
-        # Trim the video clips to match the audio duration
-        cumulative_duration = 0
-        for i in range(len(clips)):
-            if cumulative_duration + clips[i].duration > audio_duration:
-                clips[i] = clips[i].subclip(0, audio_duration - cumulative_duration)
-                clips = clips[:i+1]  # Keep only the clips up to this point
-                break
-            cumulative_duration += clips[i].duration
-    
-    final_clip = concatenate_videoclips(clips, method="compose")
-    final_clip = final_clip.set_audio(audio_clip)
-    merged_video_path = tempfile.mktemp(suffix='.mp4')
-    final_clip.write_videofile(merged_video_path, codec='libx264', audio_codec='aac')
-    return merged_video_path
+        for idx, video_url in enumerate(video_urls):
+            response = requests.get(video_url, stream=True)
+            if response.status_code == 200:
+                temp_video_path = os.path.join(temp_dir, f"video_{idx}.mp4")
+                with open(temp_video_path, "wb") as f:
+                    f.write(response.content)
+                clip = VideoFileClip(temp_video_path)
+                clip = clip.resize(newsize=(target_width, target_height))
+                clips.append(clip)
+        
+        final_clip = concatenate_videoclips(clips)
+        
+        # Add text-to-speech audio
+        temp_audio_path = os.path.join(temp_dir, "audio.mp3")
+        await generate_audio(script, temp_audio_path)
+        audio = AudioFileClip(temp_audio_path)
+        final_clip = final_clip.set_audio(audio)
+        
+        output_path = os.path.join(temp_dir, "merged_video.mp4")
+        final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+        
+        return output_path
+    finally:
+        for clip in clips:
+            clip.close()
+        final_clip.close()
+        shutil.rmtree(temp_dir)
 
 async def upload_to_azure(file_path):
-    connect_str = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
-    container_name = os.getenv('AZURE_STORAGE_CONTAINER_NAME')
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
+        container_name = os.getenv("AZURE_STORAGE_CONTAINER_NAME")
+        
+        blob_name = os.path.basename(file_path)
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+        
+        with open(file_path, "rb") as data:
+            blob_client.upload_blob(data)
+        
+        sas_token = generate_blob_sas(
+            account_name=blob_service_client.account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            account_key=blob_service_client.credential.account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        )
+        
+        blob_url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}"
+        return blob_url
+    except Exception as e:
+        logging.error(f"Error in uploading to Azure: {e}")
+        raise
 
-    blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-    blob_client = blob_service_client.get_blob_client(container=container_name, blob=os.path.basename(file_path))
-
-    with open(file_path, 'rb') as data:
-        blob_client.upload_blob(data, overwrite=True)
-
-    sas_token = generate_blob_sas(
-        account_name=blob_client.account_name,
-        container_name=blob_client.container_name,
-        blob_name=blob_client.blob_name,
-        account_key=blob_service_client.credential.account_key,
-        permission=BlobSasPermissions(read=True),
-        expiry=datetime.datetime.utcnow() + datetime.timedelta(days=365 * 10)
-    )
-
-    return f"{blob_client.url}?{sas_token}"
+@app.route('/api/messages', methods=['POST'])
+async def messages():
+    if "application/json" in request.headers["Content-Type"]:
+        body = await request.json
+    else:
+        return jsonify({"message": "Invalid content type"}), 415
+    
+    activity = Activity().deserialize(body)
+    auth_header = request.headers.get("Authorization", "")
+    
+    try:
+        await adapter.process_activity(activity, auth_header, bot.on_turn)
+        return "", 200
+    except Exception as e:
+        logging.error(f"Error processing activity: {e}")
+        return jsonify({"message": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))

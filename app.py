@@ -19,7 +19,8 @@ import shutil
 
 load_dotenv()
 app = Quart(__name__)
-cors(app)
+
+app = cors(app, allow_origin="*")
 
 client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
 

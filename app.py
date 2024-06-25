@@ -300,45 +300,45 @@ def merge_videos(video_urls, search_query):
     if not clips:
         raise Exception("No suitable video clips found.")
 
-    text_script = generate_script(search_query)
+    # text_script = generate_script(search_query)
     
-    try:
-        audio_file_path = tempfile.mktemp(suffix='.mp3')
-        generate_audio(text_script, audio_file_path)
-        audio_clip = AudioFileClip(audio_file_path)
-    except Exception as e:
-        logging.error(f"Error generating audio: {e}")
-        raise
+    # try:
+    #     audio_file_path = tempfile.mktemp(suffix='.mp3')
+    #     generate_audio(text_script, audio_file_path)
+    #     audio_clip = AudioFileClip(audio_file_path)
+    # except Exception as e:
+    #     logging.error(f"Error generating audio: {e}")
+    #     raise
 
-    audio_duration = audio_clip.duration
-    total_video_duration = sum(clip.duration for clip in clips)
+    # audio_duration = audio_clip.duration
+    # total_video_duration = sum(clip.duration for clip in clips)
     
-    if total_video_duration < audio_duration:
-        # Repeat the video clips to match the audio duration
-        repeated_clips = []
-        current_duration = 0
-        while current_duration < audio_duration:
-            for clip in clips:
-                if current_duration + clip.duration > audio_duration:
-                    remaining_duration = audio_duration - current_duration
-                    repeated_clips.append(clip.subclip(0, remaining_duration))
-                    current_duration += remaining_duration
-                    break
-                repeated_clips.append(clip)
-                current_duration += clip.duration
-        clips = repeated_clips
-    else:
-        # Trim the video clips to match the audio duration
-        cumulative_duration = 0
-        for i in range(len(clips)):
-            if cumulative_duration + clips[i].duration > audio_duration:
-                clips[i] = clips[i].subclip(0, audio_duration - cumulative_duration)
-                clips = clips[:i+1]  # Keep only the clips up to this point
-                break
-            cumulative_duration += clips[i].duration
+    # if total_video_duration < audio_duration:
+    #     # Repeat the video clips to match the audio duration
+    #     repeated_clips = []
+    #     current_duration = 0
+    #     while current_duration < audio_duration:
+    #         for clip in clips:
+    #             if current_duration + clip.duration > audio_duration:
+    #                 remaining_duration = audio_duration - current_duration
+    #                 repeated_clips.append(clip.subclip(0, remaining_duration))
+    #                 current_duration += remaining_duration
+    #                 break
+    #             repeated_clips.append(clip)
+    #             current_duration += clip.duration
+    #     clips = repeated_clips
+    # else:
+    #     # Trim the video clips to match the audio duration
+    #     cumulative_duration = 0
+    #     for i in range(len(clips)):
+    #         if cumulative_duration + clips[i].duration > audio_duration:
+    #             clips[i] = clips[i].subclip(0, audio_duration - cumulative_duration)
+    #             clips = clips[:i+1]  # Keep only the clips up to this point
+    #             break
+    #         cumulative_duration += clips[i].duration
     
     final_clip = concatenate_videoclips(clips, method="compose")
-    final_clip = final_clip.set_audio(audio_clip)
+    # final_clip = final_clip.set_audio(audio_clip)
     merged_video_path = tempfile.mktemp(suffix='.mp4')
     final_clip.write_videofile(merged_video_path, codec='libx264', audio_codec='aac')
     return merged_video_path

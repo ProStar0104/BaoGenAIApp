@@ -52,7 +52,6 @@ multidict==6.0.5
 multipledispatch==1.0.0
 numpy==2.0.0
 oauthlib==3.2.2
-openai==1.35.3
 pillow==9.5.0
 priority==2.0.0
 proglog==0.1.10
@@ -83,3 +82,4 @@ Werkzeug==3.0.3
 wsproto==1.2.0
 yarl==1.9.4
 azure-data-tables
+openai==0.28

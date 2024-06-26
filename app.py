@@ -1,36 +1,30 @@
-import logging
 import os
+import csv
+import json
+import uuid
+import msal
+import datetime
 import tempfile
 import requests
+import asyncio
+import logging
+from dotenv import load_dotenv
+
+import openai
 from quart import Quart, request, jsonify
 from quart_cors import cors
-from moviepy.editor import VideoFileClip, concatenate_videoclips
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
-from dotenv import load_dotenv
-import datetime
-from botbuilder.core import (
-    BotFrameworkAdapter,
-    BotFrameworkAdapterSettings,
-    TurnContext,
-    ConversationState,
-    MemoryStorage,
-    CardFactory,
-    MessageFactory,
-)
-from botbuilder.schema import Activity, ActivityTypes
-from botbuilder.dialogs import (
-    DialogSet,
-    DialogTurnStatus,
-    WaterfallDialog,
-    WaterfallStepContext,
-)
-import openai
-import asyncio
-import json
-from text_to_speech import save
+from quart.logging import default_handler
 from PIL import Image
-import base64
-from io import BytesIO
+from text_to_speech import save
+from moviepy.editor import VideoFileClip, concatenate_videoclips
+
+from pymongo import MongoClient, errors
+from pymongo.errors import ConnectionFailure, OperationFailure
+
+from botbuilder.schema import Activity, ActivityTypes
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext, ConversationState, MemoryStorage, CardFactory, MessageFactory
+from botbuilder.dialogs import DialogSet, DialogTurnStatus, WaterfallDialog, WaterfallStepContext, TextPrompt, DialogTurnResult
 
 load_dotenv()
 app = Quart(__name__)
@@ -50,6 +44,10 @@ conversation_state = ConversationState(memory)
 
 conversation_references = {}
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('quart.app')
+logger.addHandler(default_handler)
+
 
 class MyBot:
     def __init__(self, conversation_state: ConversationState):
@@ -62,14 +60,95 @@ class MyBot:
                 "mainDialog", [self.process_request, self.process_request_end]
             )
         )
+        self.dialogs.add(
+            WaterfallDialog(
+                "adminDialog", [self.prompt_password, self.verify_password, self.fetch_and_send_data]
+            )
+        )
+        self.dialogs.add(
+            TextPrompt("PasswordPrompt")
+        )
+        self.mongo_client = MongoClient(os.getenv("MONGODB_CONNECTION_STRING"))
+        self.database_name = os.getenv("DATABASE_NAME")
+        self.collection_name = os.getenv("COLLECTION_NAME")
 
+    async def save_query_info(self, user_email, query, file_url):
+        query_id = str(uuid.uuid4())
+        try:
+            database = self.mongo_client[self.database_name]
+            collection = database[self.collection_name]
+            retries = 5
+            while retries > 0:
+                try:
+                    query_info = {
+                        "query_id": query_id,
+                        "user_email": user_email,
+                        "query": query,
+                        "file_url": file_url,
+                        "timestamp": datetime.datetime.utcnow()
+                    }
+                    collection.insert_one(query_info)
+                    logger.info(f"Query info saved successfully: {query_info}")
+                    break
+                except (ConnectionFailure, OperationFailure) as e:
+                    retries -= 1
+                    logger.error(f"Error saving query info to MongoDB: {e}")
+                    if retries == 0:
+                        raise
+                    await asyncio.sleep(2)
+        except errors.PyMongoError as e:
+            logger.error(f"MongoDB error after retries: {e}", exc_info=True)
+        return query_id
+        
+    def get_user_email(self, aad_object_id):
+        """
+        Get user email using Azure AD object ID.
+        """
+        tenant_id = os.getenv("TENANT_ID")
+        app = msal.ConfidentialClientApplication(
+            os.getenv("MICROSOFT_APP_ID"),
+            authority=f"https://login.microsoftonline.com/{tenant_id}",
+            client_credential=os.getenv("MICROSOFT_APP_PASSWORD"),
+        )
+        graph_api_endpoint = os.getenv("GRAPH_API_ENDPOINT")
+        def get_access_token():
+            # Acquire a token from Azure AD
+            result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+            if "access_token" in result:
+                return result["access_token"]
+            else:
+                raise Exception("Could not obtain access token")
+        try:
+            if aad_object_id is None:
+                return "test@gmail.com"
+            else:
+                access_token = get_access_token()
+                headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+                user_info_url = f"{graph_api_endpoint}/users/{aad_object_id}"
+                response = requests.get(user_info_url, headers=headers)
+
+                if response.status_code == 200:
+                    user_info = response.json()
+                    return user_info.get("mail") or user_info.get("userPrincipalName")
+                else:
+                    raise Exception(f"Error fetching user info: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"Error fetching user email: {e}", exc_info=True)
+            return "test@email.com"
+        
     async def on_turn(self, turn_context: TurnContext):
         if turn_context.activity.type == ActivityTypes.message:
             dialog_context = await self.dialogs.create_context(turn_context)
             result = await dialog_context.continue_dialog()
 
             if result.status == DialogTurnStatus.Empty:
-                await dialog_context.begin_dialog("mainDialog")
+                if turn_context.activity.text is not None:
+                    if turn_context.activity.text.lower() == "admin panel":
+                        await dialog_context.begin_dialog("adminDialog")
+                    else:
+                        await dialog_context.begin_dialog("mainDialog")
+                else:
+                    await dialog_context.begin_dialog("mainDialog")
 
             await self.conversation_state.save_changes(turn_context)
         elif turn_context.activity.type == ActivityTypes.conversation_update:
@@ -77,9 +156,90 @@ class MyBot:
                 if member.id != turn_context.activity.recipient.id:
                     await send_input_card(turn_context)
 
+    async def prompt_password(self, step_context: WaterfallStepContext):
+        password_card = {
+            "type": "AdaptiveCard",
+            "body": [
+                {
+                    "type": "TextBlock",
+                    "text": "Please enter the admin password:",
+                    "wrap": True,
+                },
+                {
+                    "type": "Input.Text",
+                    "id": "admin_password",
+                    "placeholder": "Enter password",
+                    "isPassword": True
+                },
+                {
+                    "type": "ActionSet",
+                    "actions": [
+                        {
+                            "type": "Action.Submit",
+                            "title": "Submit",
+                        }
+                    ]
+                }
+            ],
+            "actions": [],
+            "version": "1.2",
+        }
+        card_attachment = CardFactory.adaptive_card(password_card)
+        await step_context.context.send_activity(MessageFactory.attachment(card_attachment))
+        return DialogTurnResult(DialogTurnStatus.Waiting) 
+    
+    async def verify_password(self, step_context: WaterfallStepContext):
+        user_input = step_context.context.activity.value["admin_password"]
+        ADMIN_PASSWORD = "ThisIsStrong123!"
+        if user_input == ADMIN_PASSWORD:
+            await step_context.context.send_activity("Password correct! Fetching data...")
+            return await step_context.next(None)
+        else:
+            await step_context.context.send_activity("Incorrect password. Please try again.")
+            return await step_context.end_dialog()
+        
+    async def fetch_and_send_data(self, step_context: WaterfallStepContext):
+        try:
+            database = self.mongo_client[self.database_name]
+            collection = database[self.collection_name]
+            data = list(collection.find())
+            
+            if data:
+                # Convert data to CSV
+                csv_file_path = tempfile.mktemp(suffix=".csv")
+                keys = data[0].keys()
+                with open(csv_file_path, 'w', newline='') as output_file:
+                    dict_writer = csv.DictWriter(output_file, fieldnames=keys)
+                    dict_writer.writeheader()
+                    dict_writer.writerows(data)
+                
+                # Upload CSV to Azure Blob Storage
+                csv_url = await upload_to_azure(csv_file_path, "Admin Panel", "admin@example.com")
+
+                await step_context.context.send_activity(f"Here is the download link for the data: {csv_url}")
+            else:
+                await step_context.context.send_activity("No data found in the database.")
+            
+        except Exception as e:
+            logging.error(f"Error fetching data: {e}")
+            await step_context.context.send_activity("An error occurred while fetching data.")
+        
+        await step_context.end_dialog()
+        await step_context.begin_dialog("mainDialog")
+
+        return DialogTurnResult(DialogTurnStatus.Complete)
+
+    
     async def process_request(self, step_context: WaterfallStepContext):
         turn_context = step_context.context
         user_profile = await self.user_state.get(turn_context, lambda: {})
+        aad_object_id = getattr(turn_context.activity.from_property, 'id')
+        user_email = self.get_user_email(aad_object_id)
+
+
+        print("*************************************")
+        print(aad_object_id)
+        print("*************************************")
 
         if user_profile.get("request_in_progress"):
             await turn_context.send_activity(
@@ -114,12 +274,12 @@ class MyBot:
 
                 # Start video generation asynchronously
                 asyncio.create_task(
-                    self.generate_and_send_video(search_query, conversation_reference)
+                    self.generate_and_send_video(search_query, conversation_reference, user_email)
                 )
             elif generate_type == "Image":
                 # Process image generation normally
                 generated_image_path = await generate_image(search_query)
-                image_url = upload_to_azure(generated_image_path)
+                image_url = await upload_to_azure(generated_image_path, search_query, user_email)
                 await turn_context.send_activity(
                     f"Here is your generated image: {image_url}"
                 )
@@ -127,7 +287,7 @@ class MyBot:
         else:
             await send_input_card(turn_context)
 
-        return await step_context.next()
+        return await step_context.next(None)
 
     async def process_request_end(self, step_context: WaterfallStepContext):
         user_profile = await self.user_state.get(step_context.context, lambda: {})
@@ -135,11 +295,11 @@ class MyBot:
         await self.user_state.set(step_context.context, user_profile)
         return await step_context.end_dialog()
 
-    async def generate_and_send_video(self, search_query, conversation_reference):
+    async def generate_and_send_video(self, search_query, conversation_reference, user_email):
         try:
             video_urls = await fetch_videos(search_query)
             merged_video_path = merge_videos(video_urls, search_query)
-            video_url = upload_to_azure(merged_video_path)
+            video_url = await upload_to_azure(merged_video_path, search_query, user_email)
 
             # Send the video URL proactively
             await self.send_proactive_message(
@@ -157,6 +317,7 @@ class MyBot:
             user_profile = await self.user_state.get(turn_context, lambda: {})
             user_profile["request_in_progress"] = False
             await self.user_state.set(turn_context, user_profile)
+
 
     async def send_proactive_message(self, conversation_reference, message):
         proactive_adapter = BotFrameworkAdapter(SETTINGS)
@@ -283,7 +444,7 @@ async def fetch_videos(search_query):
 
     response = requests.get(
         "https://api.pexels.com/videos/search",
-        params={"query": search_query, "per_page": 10},
+        params={"query": search_query, "per_page": 5},
         headers=headers,
     )
 
@@ -425,20 +586,18 @@ def merge_videos(video_urls, search_query):
     return merged_video_path
 
 
-def upload_to_azure(file_path):
+async def upload_to_azure(file_path, search_query, user_email):
 
     connect_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 
     container_name = os.getenv("AZURE_STORAGE_CONTAINER_NAME")
 
     blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-
     blob_client = blob_service_client.get_blob_client(
         container=container_name, blob=os.path.basename(file_path)
     )
 
     with open(file_path, "rb") as data:
-
         blob_client.upload_blob(data, overwrite=True)
 
     sas_token = generate_blob_sas(
@@ -450,7 +609,10 @@ def upload_to_azure(file_path):
         expiry=datetime.datetime.utcnow() + datetime.timedelta(days=365 * 10),
     )
 
-    return f"{blob_client.url}?{sas_token}"
+    file_url = f"{blob_client.url}?{sas_token}"
+    await bot.save_query_info(user_email, search_query, file_url)
+
+    return file_url
 
 
 @app.route("/api/messages", methods=["POST"])

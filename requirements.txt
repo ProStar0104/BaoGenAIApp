@@ -83,3 +83,4 @@ wsproto==1.2.0
 yarl==1.9.4
 azure-data-tables
 openai
+pymongo

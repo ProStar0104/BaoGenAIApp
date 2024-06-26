@@ -28,6 +28,9 @@ import openai
 import asyncio
 import json
 from text_to_speech import save
+from PIL import Image
+import base64
+from io import BytesIO
 
 load_dotenv()
 app = Quart(__name__)
@@ -116,7 +119,7 @@ class MyBot:
             elif generate_type == "Image":
                 # Process image generation normally
                 generated_image_path = await generate_image(search_query)
-                image_url = await upload_to_azure(generated_image_path)
+                image_url = upload_to_azure(generated_image_path)
                 await turn_context.send_activity(
                     f"Here is your generated image: {image_url}"
                 )
@@ -213,6 +216,14 @@ async def send_input_card(turn_context: TurnContext):
 bot = MyBot(conversation_state)
 
 
+def add_padding(base64_string):
+    """Adds padding to a base64 string if necessary."""
+    padding_needed = 4 - (len(base64_string) % 4)
+    if padding_needed and padding_needed != 4:
+        base64_string += "=" * padding_needed
+    return base64_string
+
+
 async def generate_image(search_query):
     openai_api_key = os.getenv("OPENAI_API_KEY")
     headers = {
@@ -241,7 +252,28 @@ async def generate_image(search_query):
     temp_image.write(image_response.content)
     temp_image.close()
 
-    return temp_image.name
+    generated_image = Image.open(temp_image.name)
+    logo = Image.open("logo.png")
+
+    # Resize the logo (optional, you can adjust the size as needed)
+    logo_size = (100, 100)  # Change this as needed
+    logo.thumbnail(logo_size, Image.ANTIALIAS)
+
+
+    # Calculate position for the logo (bottom-right corner)
+    image_width, image_height = generated_image.size
+    logo_width, logo_height = logo.size
+    position = (image_width - logo_width, image_height - logo_height)
+
+    # Paste the logo onto the generated image
+    generated_image.paste(logo, position, logo)
+
+    # Save the final image with the logo to a temporary file
+    final_image = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    generated_image.save(final_image.name)
+    final_image.close()
+
+    return final_image.name
 
 
 async def fetch_videos(search_query):
